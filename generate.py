@@ -12,9 +12,11 @@ torch._inductor.config.triton.unique_kernel_names = True
 torch._inductor.config.fx_graph_cache = True
 
 def multinomial_sample(probs_sort):
-     #idx_next = torch.multinomial(probs_sort, num_samples=1)
-     idx_next = torch.argmax(probs_sort, dim=-1, keepdim=True)
-     return idx_next
+     return torch.argmax(probs_sort, dim=-1, keepdim=True).to(dtype=torch.int)
+
+#def multinomial_sample(probs_sort): # Does multinomial sampling without a cuda synchronization
+#    q = torch.empty_like(probs_sort).exponential_(1)
+#    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     logits = logits / max(temperature, 1e-5)
@@ -137,6 +139,7 @@ def generate(
 
     device, dtype = prompt.device, prompt.dtype
     max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
+
     with torch.device(device):
         model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
         if is_speculative and draft_model is not model:
