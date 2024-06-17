@@ -7,13 +7,48 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+"Much simplied revised version, only for inference and loading model from local weights"
+
 import math
-import inspect
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+@dataclass
+#For GPT2-small model
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True
+
+class KVCache(nn.Module):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+        super().__init__()
+        cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+
+    def update(self, input_pos, k_val, v_val):
+        # input_pos: [S], k_val: [B, H, S, D]
+        assert input_pos.shape[0] == k_val.shape[2]
+
+        k_out = self.k_cache
+        v_out = self.v_cache
+        k_out[:, :, input_pos] = k_val
+        v_out[:, :, input_pos] = v_val
+
+        return k_out, v_out
+    
+def find_multiple(n: int, k: int) -> int:
+    if n % k == 0:
+        return n
+    return n + k - (n % k)
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -41,15 +76,10 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        #self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        #if not self.flash:
-        #    print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-        #    # causal mask to ensure that attention is only applied to the left in the input sequence
-        #    self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-        #                                .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+        self.kv_cache = None
+
+    def forward(self, x, input_pos, mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -58,17 +88,10 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        ## causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        #if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        #else:
-        #    # manual implementation of attention
-        #    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        #    att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        #    att = F.softmax(att, dim=-1)
-        #    att = self.attn_dropout(att)
-        #    y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        if self.kv_cache is not None:
+            k, v = self.kv_cache.update(input_pos, k, v)
+
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -100,20 +123,10 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, input_pos, mask):
+        x = x + self.attn(self.ln_1(x), input_pos, mask)
         x = x + self.mlp(self.ln_2(x))
         return x
-
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50257
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True
 
 class GPT(nn.Module):
 
@@ -137,6 +150,9 @@ class GPT(nn.Module):
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
+        self.max_batch_size = -1
+        self.max_seq_length = -1
+
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -146,6 +162,25 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def setup_caches(self, max_batch_size, max_seq_length):
+        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+            return
+        head_dim = self.config.n_embd // self.config.n_head
+        max_seq_length = find_multiple(max_seq_length, 8)
+        self.max_seq_length = max_seq_length
+        self.max_batch_size = max_batch_size
+        dtype = self.lm_head.weight.dtype
+        # For quantized layers, dtype is encoded in scales
+        if hasattr(self.lm_head, "scales"):
+            dtype = self.lm_head.scales.dtype
+        elif hasattr(self.lm_head, "scales_and_zeros"):
+            dtype = self.lm_head.scales_and_zeros.dtype
+        for b in self.transformer.h:    
+            b.attn.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_head, head_dim, dtype)
+
+        self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
+        self.positions = torch.arange(0, self.config.block_size, dtype=torch.long) 
 
     def get_num_params(self, non_embedding=True):
         """
@@ -167,38 +202,24 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, input_pos):
         device = idx.device
         b, t = idx.size()
+
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        pos = self.positions[:t] #torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        
+        mask = self.causal_mask[None, None, input_pos]
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, input_pos, mask)
         x = self.transformer.ln_f(x)
 
         logits = self.lm_head(x)
 
         return logits
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            logits = self(idx)
-            # pluck the logits at the final step
-            logits = logits[:, -1, :]
-            # select the index with the highest probability (greedy sampling)
-            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
