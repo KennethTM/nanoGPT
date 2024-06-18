@@ -26,7 +26,7 @@ class KVCache(nn.Module):
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype), persistent=False)
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype), persistent=False)
-        
+
         self.max_batch_size = max_batch_size
 
     def update(self, input_pos, k_val, v_val):
@@ -93,61 +93,6 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
-
-
-class Attention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-
-        self.head_dim = config.n_embd // config.n_head
-        total_head_dim = 3 * config.n_embd
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, total_head_dim, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.kv_cache = None
-
-        self.n_head = config.n_head
-        
-        #self.n_local_heads = config.n_local_heads
-        self.dim = config.n_embd
-    #    self._register_load_state_dict_pre_hook(self.load_hook)
-
-    #def load_hook(self, state_dict, prefix, *args):
-    #    if prefix + "wq.weight" in state_dict:
-    #        wq = state_dict.pop(prefix + "wq.weight")
-    #        wk = state_dict.pop(prefix + "wk.weight")
-    #        wv = state_dict.pop(prefix + "wv.weight")
-    #        state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
-
-    def forward(self, x, input_pos, mask):
-        bsz, seqlen, _ = x.shape
-
-        kv_size = self.n_head * self.head_dim
-        q, k, v = self.c_attn(x).split([self.dim, kv_size, kv_size], dim=-1)
-
-        q = q.view(bsz, seqlen, self.n_head, self.head_dim)
-        k = k.view(bsz, seqlen, self.n_head, self.head_dim)
-        v = v.view(bsz, seqlen, self.n_head, self.head_dim)
-
-        #q = apply_rotary_emb(q, freqs_cis)
-        #k = apply_rotary_emb(k, freqs_cis)
-
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
-
-        if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
-
-        k = k.repeat_interleave(self.n_head // self.n_head, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_head, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
-
-        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
-
-        y = self.c_proj(y)
-        return y
-
-
 
 class MLP(nn.Module):
 
