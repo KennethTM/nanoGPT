@@ -61,67 +61,95 @@ def decode_n_tokens(model, cur_token: torch.Tensor, input_pos: torch.Tensor, num
 
     return new_tokens, new_probs
 
-
+@torch.no_grad()
 def model_forward(model, x, input_pos):
     return model(x, input_pos)
 
+
+#Prompt lookup decoding function
+@torch.no_grad()
+def find_candidate_pred_tokens(input_ids: torch.Tensor, max_ngram_size: int = 3, num_pred_tokens: int = 10) -> torch.Tensor:
+    """
+    Finds candidate prediction tokens based on the input_ids.
+
+    Args:
+        input_ids (torch.Tensor): The input tensor of shape (batch_size, seq_len) containing token IDs.
+        max_ngram_size (int, optional): The maximum size of the n-gram to search for. Defaults to 3.
+        num_pred_tokens (int, optional): The number of prediction tokens to return. Defaults to 10.
+
+    Returns:
+        torch.Tensor: The tensor containing the candidate prediction tokens.
+    """
+    input_length = input_ids.size(1)
+
+    for ngram_size in range(max_ngram_size, 0, -1):
+        # Extract the last n tokens as our search ngram
+        ngram = input_ids[0, -ngram_size:].tolist()
+
+        # Create sliding windows of size ngram_size
+        windows = input_ids.unfold(dimension=1, size=ngram_size, step=1)
+
+        # Convert ngram to a tensor for comparison
+        ngram_tensor = torch.tensor(ngram, device=input_ids.device).unsqueeze(0)
+
+        # Find where the windows match the ngram
+        matches = (windows == ngram_tensor).all(dim=2)
+
+        # Get the indices of matches
+        match_indices = matches.nonzero(as_tuple=True)[1]
+
+        # Iterate through match indices to find a valid continuation
+        for idx in match_indices:
+            start_idx = idx + ngram_size
+            end_idx = start_idx + num_pred_tokens
+            # Ensure we don't go beyond the length of input_ids and avoid self-match
+            if end_idx <= input_length and start_idx < input_length - ngram_size:
+                return input_ids[0, start_idx:end_idx]
+
+    # If no match is found, return an empty tensor
+    return torch.tensor([], dtype=torch.long, device=input_ids.device)
+
 def speculative_decode(
+    input_ids: torch.Tensor,  
     model,
-    draft_model,
     cur_token: torch.Tensor,
     input_pos: int,
     speculate_k: int,
     **sampling_kwargs
 ) -> torch.Tensor:
+    
     # draft model inference sequentially
-    device = cur_token.device
-    orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
-    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
-
-    draft_tokens = torch.cat(draft_tokens)
+    draft_idx = find_candidate_pred_tokens(input_ids.unsqueeze(0), num_pred_tokens=speculate_k, max_ngram_size=3)
+    draft_len = draft_idx.size(0)
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
-        torch.cat([cur_token.view(1), draft_tokens]).view(1, -1),
-        torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device)
+        torch.cat([cur_token.view(1), draft_idx]).view(1, -1),
+        torch.arange(input_pos, input_pos + draft_len + 1, device=cur_token.device)
     )
     target_probs = logits_to_probs(target_logits[0], **sampling_kwargs)
-    draft_probs = torch.stack(draft_probs)
-    # q: target prob, p: draft prob
-    # q >= p: always accept draft token
-    # q < p: q/p prob to accept draft token
-    p = draft_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    q = target_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k]/ p)
-    rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
+    target_idx = multinomial_sample(target_probs).squeeze() #target_probs.argmax(dim=-1)
 
-    if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
-        accept_length = speculate_k + 1
-        last_token = multinomial_sample(target_probs[-1])
-        # fill last token into draft model
-        model_forward(
-            draft_model,
-            draft_tokens[-1].view(1, -1),
-            orig_input_pos + speculate_k,
+    #https://vgel.me/posts/faster-inference/#Speculative_Decoding
+    n_accepted = next(
+            idx + 1
+            for idx, (checked, draft) in enumerate(
+                # we add None here because the oracle model generates one extra
+                # token (the prediction for the last draft token)
+                zip(target_idx[:draft_len], draft_idx)
+            )
+            if checked != draft
         )
-        return torch.cat([draft_tokens, last_token])
-    else:
-        accept_length = rejected_locations[0].item()
-        p = draft_probs[accept_length]
-        q = target_probs[accept_length]
-        new = q - p
-        new = torch.where(new > 0, new, 0.0)
-        new = new / new.sum()
-        next_token = multinomial_sample(new)
-        return torch.cat([draft_tokens[:accept_length], next_token])
+    
+    return target_idx[:n_accepted]
+
 
 @torch.no_grad()
 def generate(
     model,
     prompt: torch.Tensor,
     max_new_tokens: int,
-    *,
-    draft_model: None,
+    prompt_lookup: bool = False,
     speculate_k: Optional[int] = 8,
     **sampling_kwargs
 ) -> torch.Tensor:
@@ -129,7 +157,6 @@ def generate(
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
 
-    is_speculative = draft_model is not None
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(0)
     T_new = T + max_new_tokens
@@ -137,12 +164,10 @@ def generate(
     max_seq_length = min(T_new, model.config.block_size)
 
     device, dtype = prompt.device, prompt.dtype
-    max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
+    max_seq_length = max_seq_length + speculate_k + 1 if prompt_lookup else max_seq_length
 
     with torch.device(device):
         model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
-        if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.empty(T_new, dtype=dtype, device=device)
@@ -151,20 +176,19 @@ def generate(
     input_pos = torch.arange(0, T, device=device)
 
     next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs).clone()
-    if is_speculative:
-        prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+
     seq[T] = next_token
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
 
-    if is_speculative:
+    if prompt_lookup:
         input_pos = input_pos.item()  # for speculative decoding easier to keep on host
         while input_pos < T_new - 1:
             cur_token = next_token.view(())
 
             next_tokens = speculative_decode(
-                model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
+                prompt, model, cur_token, input_pos, speculate_k, **sampling_kwargs
             )
 
             accept_counts[len(next_tokens) - 1] += 1
@@ -204,22 +228,19 @@ def run_generation(
     prompt: torch.Tensor,
     model: torch.nn.Module,
     max_new_tokens: int = 256,
+    prompt_lookup: bool = False,
     compile: bool = True,
     compile_prefill: bool = False,
-    draft_checkpoint_path: str = None,
-    speculate_k: int = 5,
+    speculate_k: int = 10,
     top_k: Optional[int] = None,
     temperature: float = 1.0,
 ):
 
     prompt_length = prompt.size(0)
     
-    is_speculative = draft_checkpoint_path is not None
-    draft_model = None
-
     if compile:
 
-        if is_speculative:
+        if prompt_lookup:
             global model_forward, logits_to_prob
             model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
 
@@ -236,7 +257,7 @@ def run_generation(
                     model,
                     prompt,
                     max_new_tokens,
-                    draft_model=draft_model,
+                    prompt_lookup=prompt_lookup,
                     speculate_k=speculate_k,
                     temperature=temperature,
                     top_k=top_k,
@@ -251,5 +272,5 @@ def run_generation(
     print(f"Time taken: {time_taken:.2f} seconds")
     print(f"Tokens per second: {int(tokens_per_second)}")
 
-    return y
+    return y, metrics
 
