@@ -1,11 +1,4 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
+#https://github.com/karpathy/nanoGPT/blob/master/model.py
 
 "Much simplied revised version, only for inference and loading model from local weights"
 
@@ -31,8 +24,10 @@ class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
-        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
-        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype), persistent=False)
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype), persistent=False)
+        
+        self.max_batch_size = max_batch_size
 
     def update(self, input_pos, k_val, v_val):
         # input_pos: [S], k_val: [B, H, S, D]
@@ -61,7 +56,7 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-'''
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -98,7 +93,7 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
-'''
+
 
 class Attention(nn.Module):
     def __init__(self, config):
@@ -116,14 +111,14 @@ class Attention(nn.Module):
         
         #self.n_local_heads = config.n_local_heads
         self.dim = config.n_embd
-        self._register_load_state_dict_pre_hook(self.load_hook)
+    #    self._register_load_state_dict_pre_hook(self.load_hook)
 
-    def load_hook(self, state_dict, prefix, *args):
-        if prefix + "wq.weight" in state_dict:
-            wq = state_dict.pop(prefix + "wq.weight")
-            wk = state_dict.pop(prefix + "wk.weight")
-            wv = state_dict.pop(prefix + "wv.weight")
-            state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
+    #def load_hook(self, state_dict, prefix, *args):
+    #    if prefix + "wq.weight" in state_dict:
+    #        wq = state_dict.pop(prefix + "wq.weight")
+    #        wk = state_dict.pop(prefix + "wk.weight")
+    #        wv = state_dict.pop(prefix + "wv.weight")
+    #        state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
     def forward(self, x, input_pos, mask):
         bsz, seqlen, _ = x.shape
@@ -153,6 +148,7 @@ class Attention(nn.Module):
         return y
 
 
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -174,8 +170,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        #self.attn = CausalSelfAttention(config)
-        self.attn = Attention(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -236,7 +231,6 @@ class GPT(nn.Module):
             b.attn.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_head, head_dim, dtype)
 
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
-        self.positions = torch.arange(0, self.config.block_size, dtype=torch.long) 
 
     def get_num_params(self, non_embedding=True):
         """
@@ -260,22 +254,15 @@ class GPT(nn.Module):
 
     def forward(self, idx, input_pos):
         assert self.causal_mask is not None, "Caches must be initialized first"
-
-        #device = idx.device
-        b, t = idx.size()
+        bs, t = idx.size()
 
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-
-        if t > 1:
-            pos = self.positions[:t] #torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-        else:
-            pos = input_pos
 
         mask = self.causal_mask[None, None, input_pos]
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        pos_emb = self.transformer.wpe(input_pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x, input_pos, mask)
